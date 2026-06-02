@@ -91,6 +91,22 @@ static const float kMinPressure     = 0.0f;
 static const int kMaxOffsetTorr     = 700;    // +/- Torr  (coarse trim)
 static const int kMaxOffsetmTorr    = 10000;   // +/- mTorr (fine trim)
 
+// Field-editable PWL calibration table. The active table lives in Data so it
+// persists to flash; these constants size and govern it.
+#define CAL_MAX_POINTS 32                      // Maximum calibration points
+
+typedef struct
+{
+  int   raw;     // Raw sensor count (as returned by GRPRES / data.rawData)
+  float torr;    // Corresponding pressure, Torr
+} CalPoint;
+
+// A new point within this many raw counts of an existing one replaces it
+// instead of adding a near-duplicate.
+static const int kCalSnapCounts = 100;
+// Raw samples averaged when capturing a calibration point.
+static const int kCalAvgSamples = 8;
+
 const char *Version = "Vacuum Gauge, version 1.0 Feb 3, 2024";
 
 // ---------------------------------------------------------------------------
@@ -109,6 +125,8 @@ typedef struct
   int           offsetTorr;      // Coarse zero offset, Torr
   int           offsetmTorr;     // Fine zero offset, mTorr
   int           useCalTable;     // 0 = factory micron formula, 1 = PWL cal table
+  int           calCount;        // Number of valid entries in calTable
+  CalPoint      calTable[CAL_MAX_POINTS]; // Field-editable raw->Torr cal points
 } Data;
 
 Data data =
@@ -138,6 +156,12 @@ auto     timer = timer_create_default();
 // True once SPIFFS has mounted successfully (set in setup()).
 static bool spiffsReady = false;
 
+// Forward declarations for calibration helpers used by the command handlers
+// below (definitions appear further down).
+static int  sampleRawAveraged(int samples);
+static bool addCalPoint(int raw, float torr);
+static void loadDefaultCalTable(void);
+
 // ---------------------------------------------------------------------------
 // Serial command handlers
 // ---------------------------------------------------------------------------
@@ -156,6 +180,76 @@ void loadSettings(void)
   else           cp.sendNAK();
 }
 
+// ---- Calibration commands -------------------------------------------------
+
+// CALPRES,<torr> - capture the current operating point: average the raw counts
+// and pair them with the user-supplied true pressure, adding or updating a table
+// point. Use CALMODE,1 to see the effect on the reading; the point is captured
+// regardless of the active mode.
+void calAddPoint(void)
+{
+  float torr;
+  if(cp.getNumArgs() != 1) { cp.sendNAK(); return; }
+  if(!cp.getValue(&torr))  { cp.sendNAK(); return; }
+
+  int raw = sampleRawAveraged(kCalAvgSamples);
+  if(!addCalPoint(raw, torr)) { cp.sendNAK(); return; }   // table full
+
+  saveData();
+  lastSaved = data;
+
+  cp.sendACK(false);
+  cp.print("Cal point raw=");
+  cp.print(raw);
+  cp.print(" torr=");
+  cp.println(torr);
+}
+
+// CALCLEAR - empty the table so a fresh one can be built point by point.
+void calClear(void)
+{
+  if(!cp.checkExpectedArgs(0)) return;
+  data.calCount = 0;
+  saveData();
+  lastSaved = data;
+  cp.sendACK();
+}
+
+// CALDEF - restore the factory default calibration table.
+void calDefaults(void)
+{
+  if(!cp.checkExpectedArgs(0)) return;
+  loadDefaultCalTable();
+  saveData();
+  lastSaved = data;
+  cp.sendACK();
+}
+
+// GRAW - take a fresh averaged raw reading and report it. Same value CALPRES
+// would capture, so it can be previewed before committing a calibration point.
+void getRaw(void)
+{
+  if(!cp.checkExpectedArgs(0)) return;
+  cp.println(sampleRawAveraged(kCalAvgSamples));
+}
+
+// CALDUMP - list the calibration table (raw count, pressure in Torr).
+void calDump(void)
+{
+  if(!cp.checkExpectedArgs(0)) return;
+  cp.sendACK(false);
+  cp.print("Cal table, ");
+  cp.print(data.calCount);
+  cp.println(" points:");
+  for(int i = 0; i < data.calCount; i++)
+  {
+    cp.print("  ");
+    cp.print(data.calTable[i].raw);
+    cp.print("  ");
+    cp.println(data.calTable[i].torr);
+  }
+}
+
 // ---------------------------------------------------------------------------
 // Command table
 //
@@ -170,11 +264,16 @@ Command cmds[] =
   {"LOAD",     CMDfunction, 0,  (void *)loadSettings,        NULL, "Load the saved parameters"},
   {"SAVE",     CMDfunction, 0,  (void *)saveSettings,        NULL, "Save parameters to file"},
   {"GPRES",    CMDdouble,   0,  (void *)&data.calPress,      NULL, "Return pressure in Torr"},
-  {"GRPRES",   CMDint,      0,  (void *)&data.rawData,       NULL, "Return raw pressure sensor data"},
+  {"GRPRES",   CMDint,      0,  (void *)&data.rawData,       NULL, "Return last raw pressure sensor data"},
+  {"GRAW",     CMDfunction, 0,  (void *)getRaw,              NULL, "Return a fresh averaged raw sensor reading"},
   {"GRTEMP",   CMDint,      0,  (void *)&data.rawTemp,       NULL, "Return raw temp sensor data"},
   {"?TOFFSET", CMDint,     -1,  (void *)&data.offsetTorr,    NULL, "Set/return Torr offset"},
   {"?MTOFFSET",CMDint,     -1,  (void *)&data.offsetmTorr,   NULL, "Set/return milli-Torr offset"},
   {"?CALMODE", CMDint,     -1,  (void *)&data.useCalTable,   NULL, "Calibration mode: 0=factory formula, 1=PWL table"},
+  {"CALPRES",  CMDfunction, 1,  (void *)calAddPoint,         NULL, "CALPRES,<torr>: capture cal point at current raw"},
+  {"CALCLEAR", CMDfunction, 0,  (void *)calClear,            NULL, "Clear the calibration table"},
+  {"CALDEF",   CMDfunction, 0,  (void *)calDefaults,         NULL, "Restore factory default cal table"},
+  {"CALDUMP",  CMDfunction, 0,  (void *)calDump,             NULL, "List the calibration table"},
   {NULL}
 };
 static CommandList cmdList = {cmds, NULL};
@@ -289,22 +388,18 @@ void displayPressure(float pressure)
 // Piece-wise linear (PWL) calibration table
 //
 // Maps the raw sensor reading (data.rawData) to pressure in Torr by linear
-// interpolation between measured calibration points. This is an OPTIONAL
-// alternative to the factory micron formula, selected by data.useCalTable
-// (see the ?CALMODE command).
+// interpolation between calibration points held in data.calTable. This is an
+// OPTIONAL alternative to the factory micron formula, selected by
+// data.useCalTable (see the ?CALMODE command).
 //
-// Points MUST be sorted by ASCENDING raw value. Note that pressure DECREASES as
-// the raw count increases. This is the factory-supplied default table; a future
-// user-calibration routine can overwrite these points and persist them.
+// The active table lives in Data, so it persists to flash and is field-editable
+// via the CALPRES / CALCLEAR / CALDEF / CALDUMP commands. Points are kept sorted
+// by ASCENDING raw value; pressure normally DECREASES as the raw count rises.
+// defaultCalTable is the factory table, copied into the active table on first
+// boot (or via CALDEF).
 // ---------------------------------------------------------------------------
 
-typedef struct
-{
-  int   raw;     // Raw sensor count (as returned in data.rawData / GRPRES)
-  float torr;    // Corresponding pressure, Torr
-} CalPoint;
-
-static const CalPoint calTable[] =
+static const CalPoint defaultCalTable[] =
 {
   {18836, 760.00f},
   {21012, 28.90f},
@@ -319,24 +414,78 @@ static const CalPoint calTable[] =
   {30777,  1.97f},
   {31484,  1.70f},
 };
-static const int calTableSize = sizeof(calTable) / sizeof(calTable[0]);
+static const int defaultCalCount = sizeof(defaultCalTable) / sizeof(defaultCalTable[0]);
 
-// Interpolate pressure (Torr) from a raw sensor count using calTable. Readings
-// outside the calibrated range are EXTRAPOLATED along the slope of the nearest
-// end segment rather than clamped, so the gauge stays responsive just beyond the
-// table. (Extrapolation is a straight-line guess; the wider you go, the larger
-// the error - add calibration points to extend the trustworthy range. A negative
-// extrapolated result is floored later by the kMinPressure clamp.)
+// Copy the factory default table into the active (persisted) table.
+static void loadDefaultCalTable(void)
+{
+  data.calCount = defaultCalCount;
+  for(int i = 0; i < defaultCalCount; i++) data.calTable[i] = defaultCalTable[i];
+}
+
+// Sort the active table in place by ascending raw value (insertion sort - the
+// table is small, so this is more than fast enough).
+static void sortCalTable(void)
+{
+  for(int i = 1; i < data.calCount; i++)
+  {
+    CalPoint key = data.calTable[i];
+    int j = i - 1;
+    while(j >= 0 && data.calTable[j].raw > key.raw)
+    {
+      data.calTable[j + 1] = data.calTable[j];
+      j--;
+    }
+    data.calTable[j + 1] = key;
+  }
+}
+
+// Add or update a calibration point. If an existing point's raw is within
+// kCalSnapCounts of `raw`, that point is replaced (both raw and torr updated);
+// otherwise a new point is appended. The table is then re-sorted by raw.
+// Returns false only when the table is full and no nearby point exists.
+// Monotonicity is NOT enforced - the caller is trusted.
+static bool addCalPoint(int raw, float torr)
+{
+  for(int i = 0; i < data.calCount; i++)
+  {
+    if(abs(data.calTable[i].raw - raw) <= kCalSnapCounts)
+    {
+      data.calTable[i].raw  = raw;
+      data.calTable[i].torr = torr;
+      sortCalTable();
+      return true;
+    }
+  }
+  if(data.calCount >= CAL_MAX_POINTS) return false;
+  data.calTable[data.calCount].raw  = raw;
+  data.calTable[data.calCount].torr = torr;
+  data.calCount++;
+  sortCalTable();
+  return true;
+}
+
+// Interpolate pressure (Torr) from a raw sensor count using the active table.
+// Readings outside the calibrated range are EXTRAPOLATED along the slope of the
+// nearest end segment rather than clamped, so the gauge stays responsive just
+// beyond the table. (Extrapolation is a straight-line guess; error grows with
+// distance - add points to extend the trustworthy range. A negative result is
+// floored later by the kMinPressure clamp.) With fewer than two points there is
+// nothing to interpolate.
 static float pwlPressure(int raw)
 {
-  // Find the segment [i-1, i] to use. Interior readings land in their bracketing
-  // segment; readings below the first point reuse the first segment and those
-  // above the last point reuse the last segment - both then extrapolate.
-  int i = 1;
-  while(i < calTableSize - 1 && raw >= calTable[i].raw) i++;
+  if(data.calCount <= 0) return 0.0f;
+  if(data.calCount == 1) return data.calTable[0].torr;
 
-  float r0 = calTable[i - 1].raw,  r1 = calTable[i].raw;
-  float p0 = calTable[i - 1].torr, p1 = calTable[i].torr;
+  // Find the segment [i-1, i] to use. Interior readings land in their bracketing
+  // segment; readings below the first / above the last point reuse the first /
+  // last segment and extrapolate.
+  int i = 1;
+  while(i < data.calCount - 1 && raw >= data.calTable[i].raw) i++;
+
+  float r0 = data.calTable[i - 1].raw,  r1 = data.calTable[i].raw;
+  float p0 = data.calTable[i - 1].torr, p1 = data.calTable[i].torr;
+  if(r1 == r0) return p0;   // coincident raws (possible: monotonicity not enforced)
   return p0 + (p1 - p0) * ((float)(raw - r0) / (r1 - r0));
 }
 
@@ -365,6 +514,26 @@ static bool readSensorWord(int &word, int &temp)
     i++;
   }
   return i == kSensorBytes;
+}
+
+// Average several raw pressure reads (register 0xD0) for a stable calibration
+// sample. Blocks for roughly samples * 10 ms; only called from the CALPRES
+// command handler, never from the periodic task.
+static int sampleRawAveraged(int samples)
+{
+  if(samples < 1) samples = 1;
+  long sum = 0;
+  int  raw, temp;
+  for(int i = 0; i < samples; i++)
+  {
+    Wire.beginTransmission(data.TWIadd);
+    Wire.write(0xD0);
+    Wire.endTransmission(true);
+    readSensorWord(raw, temp);
+    sum += raw;
+    delay(10);
+  }
+  return (int)(sum / samples);
 }
 
 bool readPressure(void *)
@@ -460,9 +629,15 @@ void setup()
   buttonA.begin();
   buttonB.begin();
 
-  // Mount the filesystem once, then load (or create) the settings file.
+  // Mount the filesystem once, then load (or create) the settings file. On a
+  // fresh device (or after a struct-layout change) loadData() fails, so seed the
+  // factory calibration table before writing the first settings file.
   spiffsReady = SPIFFS.begin(FORMAT_SPIFFS_IF_FAILED);
-  if(!loadData()) saveData();
+  if(!loadData())
+  {
+    loadDefaultCalTable();
+    saveData();
+  }
   lastSaved = data;
 
   timer.every(kReadIntervalMs, readPressure);

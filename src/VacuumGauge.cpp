@@ -530,6 +530,7 @@ static void startAP()
     WiFi.softAPConfig(kApIP, kApIP, IPAddress(255, 255, 255, 0));
     WiFi.softAP(kApSSID);
     dnsServer.start(53, "*", kApIP);
+    WiFi.scanNetworks(true);  // async scan; results available via GET /scan
     appState = STATE_PORTAL;
 }
 
@@ -552,38 +553,125 @@ static const char kSetupHtml[] = R"rawhtml(<!DOCTYPE html>
 <meta name="viewport" content="width=device-width,initial-scale=1">
 <title>VacuumGauge Setup</title>
 <style>
-body{font-family:sans-serif;max-width:420px;margin:40px auto;padding:20px;background:#111;color:#eee}
-h1{color:#4af;margin-bottom:24px}
-label{display:block;font-size:13px;color:#aaa;margin-top:14px}
-input{width:100%;padding:12px;margin-top:4px;box-sizing:border-box;border-radius:6px;
-      border:1px solid #444;background:#222;color:#eee;font-size:16px}
-button{display:block;width:100%;padding:14px;margin-top:24px;background:#4af;color:#000;
-       border:none;border-radius:6px;font-size:18px;font-weight:bold;cursor:pointer}
+body{font-family:sans-serif;max-width:440px;margin:0 auto;padding:20px 16px 48px;background:#111;color:#eee}
+h1{color:#4af;margin-bottom:4px}
+.step{color:#aaa;font-size:12px;text-transform:uppercase;letter-spacing:1px;margin:22px 0 8px}
+select{width:100%;padding:12px;box-sizing:border-box;border-radius:6px;
+  border:1px solid #444;background:#222;color:#eee;font-size:16px}
+input[type=password]{width:100%;padding:12px;box-sizing:border-box;border-radius:6px;
+  border:1px solid #444;background:#222;color:#eee;font-size:16px;margin-top:2px}
+.net{display:flex;align-items:center;padding:12px 14px;margin-bottom:6px;border-radius:8px;
+  background:#1c1c1c;border:2px solid transparent;cursor:pointer;gap:10px}
+.net:hover{border-color:#334}
+.net.sel{border-color:#4af;background:#0d1d2d}
+.ssid-txt{flex:1;font-size:15px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.bars{font-size:13px;color:#4af;min-width:28px}
+.lock{font-size:13px;opacity:.55}
+#scan-msg{color:#888;font-size:13px;padding:6px 0}
+#pass-wrap{display:none;margin-top:2px}
+button{display:block;width:100%;padding:14px;margin-top:26px;background:#4af;color:#000;
+  border:none;border-radius:8px;font-size:17px;font-weight:bold;cursor:pointer}
 button:hover{background:#6cf}
-#msg{text-align:center;margin-top:16px;min-height:20px;color:#4f4}
+#msg{text-align:center;margin-top:14px;min-height:18px;font-size:14px;color:#4f4}
 </style>
 </head>
 <body>
 <h1>VacuumGauge Setup</h1>
-<label>WiFi Network (SSID)</label>
-<input id="ssid" type="text" placeholder="Enter WiFi name" autocomplete="off" autocorrect="off" spellcheck="false">
-<label>WiFi Password</label>
-<input id="pass" type="password" placeholder="Enter WiFi password">
-<label>Device Name</label>
-<input id="name" type="text" placeholder="Press" value="Press" maxlength="19">
-<button onclick="save()">Save &amp; Connect</button>
+
+<div class="step">Step 1 — Gauge identity</div>
+<select id="gname">
+  <option value="Gauge A">Gauge A</option>
+  <option value="Gauge B">Gauge B</option>
+  <option value="Gauge C">Gauge C</option>
+  <option value="Gauge D">Gauge D</option>
+  <option value="Gauge E">Gauge E</option>
+  <option value="Gauge F">Gauge F</option>
+  <option value="Gauge G">Gauge G</option>
+  <option value="Gauge H">Gauge H</option>
+</select>
+
+<div class="step">Step 2 — Select WiFi network</div>
+<div id="scan-msg">&#8635; Scanning for networks&hellip;</div>
+<div id="netlist"></div>
+<input type="hidden" id="ssid">
+
+<div id="pass-wrap">
+  <div class="step">Step 3 — WiFi password</div>
+  <input id="pass" type="password" placeholder="Leave blank if open network">
+</div>
+
+<button onclick="doSave()">Save &amp; Connect</button>
 <p id="msg"></p>
+
 <script>
-function save(){
-  var s=document.getElementById('ssid').value.trim();
-  if(!s){document.getElementById('msg').innerText='SSID is required';return;}
-  var d={ssid:s,pass:document.getElementById('pass').value,
-         name:document.getElementById('name').value.trim()||'Press'};
-  document.getElementById('msg').innerText='Saving...';
-  fetch('/save',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(d)})
+function bars(r){
+  if(r>=-55)return'&#9608;&#9608;&#9608;&#9608;';
+  if(r>=-65)return'&#9608;&#9608;&#9608;&thinsp;';
+  if(r>=-75)return'&#9608;&#9608;&thinsp;&thinsp;';
+  return'&#9608;&thinsp;&thinsp;&thinsp;';
+}
+function esc(s){var d=document.createElement('div');d.appendChild(document.createTextNode(s));return d.innerHTML;}
+var chosen='';
+function pick(el,ssid){
+  document.querySelectorAll('.net').forEach(function(n){n.classList.remove('sel');});
+  el.classList.add('sel');
+  chosen=ssid;
+  document.getElementById('ssid').value=ssid;
+  document.getElementById('pass-wrap').style.display='block';
+  document.getElementById('pass').focus();
+}
+function render(nets){
+  var seen={},list=[];
+  nets.forEach(function(n){if(!seen[n.ssid]||n.rssi>seen[n.ssid].rssi)seen[n.ssid]=n;});
+  for(var k in seen)list.push(seen[k]);
+  list.sort(function(a,b){return b.rssi-a.rssi;});
+  var d=document.getElementById('netlist');
+  d.innerHTML='';
+  if(!list.length){
+    d.innerHTML='<div id="scan-msg">No networks found. <a href="#" onclick="doScan(true);return false">Retry</a></div>';
+    return;
+  }
+  list.forEach(function(n){
+    var el=document.createElement('div');
+    el.className='net';
+    el.innerHTML='<span class="bars">'+bars(n.rssi)+'</span>'+
+      '<span class="ssid-txt">'+esc(n.ssid)+'</span>'+
+      (n.enc?'<span class="lock">&#128274;</span>':'');
+    el.onclick=function(){pick(el,n.ssid);};
+    d.appendChild(el);
+  });
+}
+function poll(){
+  fetch('/scan').then(function(r){return r.json();}).then(function(j){
+    if(j.status==='scanning'){setTimeout(poll,2000);}
+    else{document.getElementById('scan-msg').style.display='none';render(j);}
+  }).catch(function(){setTimeout(poll,3000);});
+}
+function doScan(refresh){
+  document.getElementById('scan-msg').innerHTML='&#8635; Scanning&hellip;';
+  document.getElementById('scan-msg').style.display='';
+  document.getElementById('netlist').innerHTML='';
+  if(refresh){fetch('/scan?refresh=1').then(function(){setTimeout(poll,2500);});}
+  else{poll();}
+}
+doScan(false);
+function doSave(){
+  if(!chosen){
+    document.getElementById('msg').style.color='#fa4';
+    document.getElementById('msg').innerText='Please select a WiFi network first.';
+    return;
+  }
+  var payload={ssid:chosen,pass:document.getElementById('pass').value,
+               name:document.getElementById('gname').value};
+  document.getElementById('msg').style.color='#4f4';
+  document.getElementById('msg').innerText='Saving…';
+  fetch('/save',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(payload)})
   .then(function(r){return r.text();})
-  .then(function(t){document.getElementById('msg').innerText='Saved! Device restarting...';})
-  .catch(function(e){document.getElementById('msg').innerText='Error: '+e;});
+  .then(function(){document.getElementById('msg').innerText='Saved! Device restarting…';})
+  .catch(function(){
+    document.getElementById('msg').style.color='#f84';
+    document.getElementById('msg').innerText='Error — please try again.';
+  });
 }
 </script>
 </body>
@@ -599,6 +687,39 @@ static void setupServer()
     server.on("/", HTTP_GET, [](AsyncWebServerRequest *request)
     {
         request->send(200, "text/html", kSetupHtml);
+    });
+
+    // WiFi scan results for the portal network picker
+    server.on("/scan", HTTP_GET, [](AsyncWebServerRequest *request)
+    {
+        bool doRefresh = request->hasParam("refresh");
+        int16_t n = WiFi.scanComplete();
+
+        if (doRefresh || n == WIFI_SCAN_FAILED)
+        {
+            if (n != WIFI_SCAN_RUNNING) WiFi.scanNetworks(true);
+            request->send(202, "application/json", "{\"status\":\"scanning\"}");
+            return;
+        }
+        if (n == WIFI_SCAN_RUNNING)
+        {
+            request->send(202, "application/json", "{\"status\":\"scanning\"}");
+            return;
+        }
+
+        JsonDocument doc;
+        JsonArray arr = doc.to<JsonArray>();
+        for (int16_t i = 0; i < n && i < 20; i++)
+        {
+            JsonObject obj = arr.add<JsonObject>();
+            obj["ssid"] = WiFi.SSID(i);
+            obj["rssi"] = WiFi.RSSI(i);
+            obj["enc"]  = (WiFi.encryptionType(i) != WIFI_AUTH_OPEN);
+        }
+        WiFi.scanDelete();
+        String body;
+        serializeJson(doc, body);
+        request->send(200, "application/json", body);
     });
 
     // Receive credentials via POST /save

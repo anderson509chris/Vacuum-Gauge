@@ -2,7 +2,12 @@
   "permissions": {
     "allow": [
       "Bash(~/.platformio/penv/bin/pio --version)",
-      "Bash(~/.platformio/penv/bin/pio run *)"
+      "Bash(~/.platformio/penv/bin/pio run *)",
+      "Bash(git -C \"c:/Users/ander/Documents/VacuumGuage\" config --global user.name \"Chris Anderson\")",
+      "Bash(git -C \"c:/Users/ander/Documents/VacuumGuage\" config --global user.email \"chris@gaa-ce.com\")",
+      "Bash(git -C \"c:/Users/ander/Documents/VacuumGuage\" status)",
+      "Bash(git add *)",
+      "Bash(git commit -m ' *)"
     ]
   }
 }

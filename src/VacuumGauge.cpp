@@ -41,8 +41,8 @@ static const int8_t kQSPI_SDIO2 = 13;
 static const int8_t kQSPI_SDIO3 = 14;
 static const int8_t kQSPI_RST   = 21;
 
-static const int16_t kScreenW = 280;
-static const int16_t kScreenH = 456;
+static const int16_t kScreenW = 456;
+static const int16_t kScreenH = 280;
 
 // I2C sensor
 static const int  kI2C_SDA = 1;
@@ -146,9 +146,12 @@ static Arduino_DataBus *bus =
                           kQSPI_SDIO1, kQSPI_SDIO2, kQSPI_SDIO3);
 // Constructor: (bus, rst, rotation, w, h, col_offset1, row_offset1, col_offset2, row_offset2)
 // Offsets from GFX library board reference — required to map the physical pixel array correctly.
+// CO5300 has no hardware transpose — keep it in portrait (its only native mode).
+// Software landscape is done via canvas rotation=1, which remaps draw calls into
+// the portrait framebuffer so flush() sends correctly-ordered pixels to the panel.
 static Arduino_GFX    *display = new Arduino_CO5300(
     bus, kQSPI_RST, 0, 280, 456, 20, 0, 180, 24);
-static Arduino_Canvas *canvas  = new Arduino_Canvas(kScreenW, kScreenH, display, 0, 0, 0);
+static Arduino_Canvas *canvas  = new Arduino_Canvas(280, 456, display, 0, 0, 1);
 
 static AsyncWebServer server(80);
 static DNSServer      dnsServer;

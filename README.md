@@ -1,11 +1,18 @@
 # Vacuum Gauge
 
 Firmware for a digital vacuum pressure gauge built around a **Posifa** I2C
-pressure sensor and a **Waveshare ESP32-S3-Touch-AMOLED-1.64** with a
-280 × 456 CO5300 AMOLED display (rendered in landscape at 456 × 280). The gauge
-reads the sensor every 500 ms, auto-ranges the pressure between Torr and mTorr,
-and exposes a REST HTTP API so the **GAA-CE desktop application** can discover
-and read any gauge on the local network by name.
+pressure sensor. A single codebase targets two hardware configurations — the
+display layer is board-specific; all sensor logic, calibration, WiFi setup,
+NVS storage, and REST API are identical on both.
+
+| Environment | Board | Display |
+|---|---|---|
+| `waveshare_amoled_164` | Waveshare ESP32-S3-Touch-AMOLED-1.64 | 280 × 456 CO5300 AMOLED, landscape |
+| `lilygo_t_qt` | LILYGO T-QT Pro S3 | 128 × 128 GC9A01 round TFT |
+
+The gauge reads the sensor every 500 ms, auto-ranges the pressure between Torr
+and mTorr, and exposes a REST HTTP API so the **GAA-CE desktop application**
+can discover and read any gauge on the local network by name.
 
 ## Features
 
@@ -30,26 +37,26 @@ and read any gauge on the local network by name.
 
 ## Hardware
 
+### Waveshare ESP32-S3-Touch-AMOLED-1.64 (`waveshare_amoled_164`)
+
 | Component   | Detail                                                         |
 | ----------- | -------------------------------------------------------------- |
-| MCU board   | Waveshare ESP32-S3-Touch-AMOLED-1.64                           |
 | MCU         | ESP32-S3R8, 16 MB Flash (QIO), 8 MB OPI PSRAM                 |
-| Display     | 280 × 456 CO5300 AMOLED, QSPI interface (landscape, software-rotated) |
-| Sensor      | Posifa pressure sensor, I2C address `0x50`                     |
-| I2C pins    | SDA = GPIO 1, SCL = GPIO 2 @ 100 kHz                          |
+| Display     | 280 × 456 CO5300 AMOLED, QSPI (software-rotated to landscape) |
+| Sensor      | Posifa, I2C `0x50` — SDA = GPIO 1, SCL = GPIO 2               |
 | BOOT button | GPIO 0 — long-press (3 s) resets WiFi credentials             |
 
-### QSPI display wiring
+QSPI wiring: CS=9, SCK=10, D0=11, D1=12, D2=13, D3=14, RST=21
 
-| Signal | GPIO |
-| ------ | ---- |
-| CS     | 9    |
-| SCK    | 10   |
-| D0     | 11   |
-| D1     | 12   |
-| D2     | 13   |
-| D3     | 14   |
-| RST    | 21   |
+### LILYGO T-QT Pro S3 (`lilygo_t_qt`)
+
+| Component    | Detail                                                        |
+| ------------ | ------------------------------------------------------------- |
+| MCU          | ESP32-S3, 4 MB Flash, 2 MB PSRAM                             |
+| Display      | 128 × 128 GC9A01 round TFT, SPI via TFT_eSPI                 |
+| Sensor       | Posifa, I2C `0x50` — SDA = GPIO 43, SCL = GPIO 44            |
+| Button A     | GPIO 0 — short-press trims offset up; long-press (3 s) resets WiFi |
+| Button B     | GPIO 47 — short-press trims offset down                       |
 
 ## First-boot setup
 
@@ -165,36 +172,54 @@ calibrated range are extrapolated along the nearest end segment.
 ## Building
 
 [PlatformIO](https://platformio.org/) project — Arduino framework on the
-pioarduino ESP32 platform (required for QSPI support).
+pioarduino ESP32 platform (required for ESP32 Arduino core v3).
 
 ```bash
-pio run                        # build only
-pio run -t upload -t monitor   # build, flash, open serial monitor
+# Waveshare AMOLED (default)
+pio run -e waveshare_amoled_164
+pio run -e waveshare_amoled_164 -t upload -t monitor
+
+# LILYGO T-QT Pro
+pio run -e lilygo_t_qt
+pio run -e lilygo_t_qt -t upload -t monitor
 ```
 
 `patch_libs.py` runs automatically before each build and patches
 `GAACE_Core/debug.cpp` for ESP32 Arduino core v3 API compatibility.
 
-### Dependencies (fetched automatically by PlatformIO)
+### Dependencies
 
-| Library                          | Purpose                          |
-| -------------------------------- | -------------------------------- |
-| moononournation/GFX Library for Arduino | CO5300 QSPI display driver  |
-| me-no-dev/AsyncTCP               | Async TCP for the web server     |
-| me-no-dev/ESPAsyncWebServer      | HTTP REST API + captive portal   |
-| bblanchon/ArduinoJson            | JSON serialisation               |
-| GordonAnderson/GAACE_Core        | Serial command processor         |
+Shared by both environments:
+
+| Library                     | Purpose                              |
+| --------------------------- | ------------------------------------ |
+| me-no-dev/AsyncTCP          | Async TCP for the web server         |
+| me-no-dev/ESPAsyncWebServer | HTTP REST API + captive portal       |
+| bblanchon/ArduinoJson       | JSON serialisation                   |
+| GordonAnderson/GAACE_Core   | Serial command processor             |
+
+Environment-specific:
+
+| Library                             | Environment          | Purpose              |
+| ----------------------------------- | -------------------- | -------------------- |
+| moononournation/GFX Library for Arduino | waveshare_amoled_164 | CO5300 QSPI display |
+| Bodmer/TFT_eSPI                     | lilygo_t_qt          | GC9A01 TFT display   |
+
+TFT_eSPI is configured by `include/User_Setup.h` (loaded automatically for the
+`lilygo_t_qt` build via `-DUSER_SETUP_LOADED`). Verify the pin numbers in that
+file match your specific T-QT Pro S3 board if the display doesn't initialise.
 
 ## Project layout
 
 ```
 .
-├── platformio.ini          PlatformIO environment (board: esp32-s3-devkitc-1)
-├── patch_libs.py           Pre-build library compatibility patch
+├── platformio.ini          Two PlatformIO environments (waveshare_amoled_164, lilygo_t_qt)
+├── patch_libs.py           Pre-build library compatibility patch (GAACE_Core / core v3)
 ├── rename_firmware.py      Post-build firmware versioning / release copy
-├── src/VacuumGauge.cpp     Application firmware
+├── src/VacuumGauge.cpp     Application firmware (#ifdef for display sections only)
 ├── include/
 │   ├── VacuumGauge.h       Function prototypes
+│   ├── User_Setup.h        TFT_eSPI config for LILYGO T-QT Pro S3 (lilygo_t_qt only)
 │   ├── version.h           Firmware version number
 │   └── build_info.h        Auto-generated build timestamp (do not edit)
 └── releases/               Versioned .bin files safe to commit

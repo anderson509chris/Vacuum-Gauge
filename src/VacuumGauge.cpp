@@ -1,11 +1,11 @@
 //
 // VacuumGauge.cpp
 //
-// Vacuum pressure gauge for Waveshare ESP32-S3-Touch-AMOLED-1.64
-// (CO5300 QSPI AMOLED, 280x456).
+// Dual-target vacuum pressure gauge firmware.
+//   BOARD_WAVESHARE_AMOLED  — Waveshare ESP32-S3-Touch-AMOLED-1.64 (CO5300 QSPI, 280x456)
+//   BOARD_LILYGO_TQT        — LILYGO T-QT Pro S3 (GC9A01 SPI, 128x128)
 //
-// Sensor:   Posifa I2C @ 0x50, SDA=GPIO1, SCL=GPIO2
-// Display:  Arduino_GFX + Arduino_Canvas (offscreen framebuffer flushed per frame)
+// Sensor:   Posifa I2C @ 0x50
 // Storage:  Preferences (NVS), namespace "vacgauge"
 // WiFi:     Captive-portal AP on first boot; STA + HTTP REST API thereafter
 // Commands: USB Serial at 115200 via GAACE_Core commandProcessor
@@ -18,7 +18,14 @@
 #include <Preferences.h>
 #include <ESPAsyncWebServer.h>
 #include <ArduinoJson.h>
-#include <Arduino_GFX_Library.h>
+
+#ifdef BOARD_WAVESHARE_AMOLED
+  #include <Arduino_GFX_Library.h>
+#else  // BOARD_LILYGO_TQT
+  #include <SPI.h>
+  #include <TFT_eSPI.h>
+  #include <Button.h>
+#endif
 
 #include <commandProcessor.h>
 #include <debug.h>
@@ -29,25 +36,32 @@
 #include "build_info.h"
 
 // ---------------------------------------------------------------------------
-// Pin definitions
+// Board-specific pin definitions and screen dimensions
 // ---------------------------------------------------------------------------
 
-// QSPI display (verified against GFX library Arduino_GFX_dev_device.h for this board)
-static const int8_t kQSPI_CS    = 9;
-static const int8_t kQSPI_SCLK  = 10;
-static const int8_t kQSPI_SDIO0 = 11;
-static const int8_t kQSPI_SDIO1 = 12;
-static const int8_t kQSPI_SDIO2 = 13;
-static const int8_t kQSPI_SDIO3 = 14;
-static const int8_t kQSPI_RST   = 21;
+#ifdef BOARD_WAVESHARE_AMOLED
+  // QSPI display (verified against GFX library Arduino_GFX_dev_device.h)
+  static const int8_t  kQSPI_CS    = 9;
+  static const int8_t  kQSPI_SCLK  = 10;
+  static const int8_t  kQSPI_SDIO0 = 11;
+  static const int8_t  kQSPI_SDIO1 = 12;
+  static const int8_t  kQSPI_SDIO2 = 13;
+  static const int8_t  kQSPI_SDIO3 = 14;
+  static const int8_t  kQSPI_RST   = 21;
+  static const int16_t kScreenW    = 456;   // landscape (software-rotated)
+  static const int16_t kScreenH    = 280;
+  static const int     kI2C_SDA    = 1;
+  static const int     kI2C_SCL    = 2;
+#else  // BOARD_LILYGO_TQT
+  static const int16_t kScreenW    = 128;
+  static const int16_t kScreenH    = 128;
+  static const int     kI2C_SDA    = 43;
+  static const int     kI2C_SCL    = 44;
+  static const uint8_t kButtonB_Pin = 47;  // second button: offset trim down
+  static const uint8_t kTFT_BL     = 10;  // backlight GPIO
+#endif
 
-static const int16_t kScreenW = 456;
-static const int16_t kScreenH = 280;
-
-// I2C sensor
-static const int  kI2C_SDA = 1;
-static const int  kI2C_SCL = 2;
-static const long kI2C_Hz  = 100000;
+static const long kI2C_Hz = 100000;
 
 // Boot button (active LOW)
 static const uint8_t       kBootPin         = 0;
@@ -141,17 +155,19 @@ static AppState appState = STATE_PORTAL;
 // Global objects
 // ---------------------------------------------------------------------------
 
-static Arduino_DataBus *bus =
-    new Arduino_ESP32QSPI(kQSPI_CS, kQSPI_SCLK, kQSPI_SDIO0,
-                          kQSPI_SDIO1, kQSPI_SDIO2, kQSPI_SDIO3);
-// Constructor: (bus, rst, rotation, w, h, col_offset1, row_offset1, col_offset2, row_offset2)
-// Offsets from GFX library board reference — required to map the physical pixel array correctly.
-// CO5300 has no hardware transpose — keep it in portrait (its only native mode).
-// Software landscape is done via canvas rotation=1, which remaps draw calls into
-// the portrait framebuffer so flush() sends correctly-ordered pixels to the panel.
-static Arduino_GFX    *display = new Arduino_CO5300(
-    bus, kQSPI_RST, 0, 280, 456, 20, 0, 180, 24);
-static Arduino_Canvas *canvas  = new Arduino_Canvas(280, 456, display, 0, 0, 1);
+#ifdef BOARD_WAVESHARE_AMOLED
+  // CO5300 has no hardware transpose — portrait native mode only.
+  // Canvas rotation=1 remaps draw calls so flush() sends portrait-order pixels.
+  static Arduino_DataBus *bus =
+      new Arduino_ESP32QSPI(kQSPI_CS, kQSPI_SCLK, kQSPI_SDIO0,
+                            kQSPI_SDIO1, kQSPI_SDIO2, kQSPI_SDIO3);
+  static Arduino_GFX    *display = new Arduino_CO5300(
+      bus, kQSPI_RST, 0, 280, 456, 20, 0, 180, 24);
+  static Arduino_Canvas *canvas  = new Arduino_Canvas(280, 456, display, 0, 0, 1);
+#else  // BOARD_LILYGO_TQT
+  static TFT_eSPI tft = TFT_eSPI();
+  static Button   buttonB(kButtonB_Pin);
+#endif
 
 static AsyncWebServer server(80);
 static DNSServer      dnsServer;
@@ -422,6 +438,8 @@ static void sensorTask(void *param)
 // Display
 // ---------------------------------------------------------------------------
 
+#ifdef BOARD_WAVESHARE_AMOLED
+
 static void centerText(const char *str, int16_t y, uint8_t sz)
 {
     canvas->setTextSize(sz);
@@ -461,63 +479,103 @@ static void updateDisplay()
 
     case STATE_RUNNING:
     {
-        // Device name — top left
         canvas->setTextColor(C_GREEN);
         canvas->setTextSize(2);
         canvas->setCursor(4, 4);
         canvas->print(data.Name);
 
-        // Snapshot live readings
         float p;
-        int   raw;
         xSemaphoreTake(dataMutex, portMAX_DELAY);
-        p   = (float)data.calPress;
-        raw = data.rawData;
+        p = (float)data.calPress;
         xSemaphoreGive(dataMutex);
 
-        // Pressure number and unit
         char        pStr[16];
         const char *unit;
-        if (p < 1.0f)
-        {
-            snprintf(pStr, sizeof(pStr), "%.0f", p * 1000.0f);
-            unit = "mTorr";
-        }
-        else if (p < 100.0f)
-        {
-            snprintf(pStr, sizeof(pStr), "%.1f", p);
-            unit = "Torr";
-        }
-        else
-        {
-            snprintf(pStr, sizeof(pStr), "%.0f", p);
-            unit = "Torr";
-        }
+        if (p < 1.0f)       { snprintf(pStr, sizeof(pStr), "%.0f", p * 1000.0f); unit = "mTorr"; }
+        else if (p < 100.0f){ snprintf(pStr, sizeof(pStr), "%.1f", p);            unit = "Torr";  }
+        else                 { snprintf(pStr, sizeof(pStr), "%.0f", p);            unit = "Torr";  }
 
         canvas->setTextColor(C_WHITE);
-        centerText(pStr, kScreenH / 2 - 56, 6);   // 48px tall at size 6
-
+        centerText(pStr, kScreenH / 2 - 56, 6);
         canvas->setTextColor(C_CYAN);
-        centerText(unit, kScreenH / 2 + 16, 4);    // 32px tall at size 4
+        centerText(unit, kScreenH / 2 + 16, 4);
 
-        // IP + cal mode — bottom
         canvas->setTextColor(C_LGRAY);
         canvas->setTextSize(2);
-
         String ip = (WiFi.status() == WL_CONNECTED) ? WiFi.localIP().toString() : "---";
-        String ipLine = "IP: " + ip;
-        String calLine = String("Cal: ") + (data.useCalTable ? "Table" : "Factory");
-
         canvas->setCursor(4, kScreenH - 40);
-        canvas->print(ipLine);
+        canvas->print("IP: "); canvas->print(ip);
         canvas->setCursor(4, kScreenH - 20);
-        canvas->print(calLine);
+        canvas->print("Cal: "); canvas->print(data.useCalTable ? "Table" : "Factory");
         break;
     }
     }
-
     canvas->flush();
 }
+
+#else  // BOARD_LILYGO_TQT — TFT_eSPI on 128x128 GC9A01
+
+static void tftCenter(const char *str, int16_t y, uint8_t font)
+{
+    int16_t x = (128 - (int16_t)tft.textWidth(str, font)) / 2;
+    tft.drawString(str, x < 0 ? 0 : x, y, font);
+}
+
+static void updateDisplay()
+{
+    tft.fillScreen(TFT_BLACK);
+
+    switch (appState)
+    {
+    case STATE_PORTAL:
+        tft.setTextColor(TFT_YELLOW, TFT_BLACK);
+        tftCenter("VacuumGauge", 18, 2);
+        tftCenter("Setup", 38, 2);
+        tft.setTextColor(TFT_WHITE, TFT_BLACK);
+        tftCenter("Join WiFi:", 64, 1);
+        tft.setTextColor(TFT_CYAN, TFT_BLACK);
+        tftCenter(kApSSID, 76, 1);
+        tft.setTextColor(TFT_WHITE, TFT_BLACK);
+        tftCenter("192.168.4.1", 96, 1);
+        break;
+
+    case STATE_CONNECTING:
+        tft.setTextColor(TFT_YELLOW, TFT_BLACK);
+        tftCenter("Connecting", 28, 2);
+        tft.setTextColor(TFT_WHITE, TFT_BLACK);
+        tftCenter(data.ssid, 58, 1);
+        break;
+
+    case STATE_RUNNING:
+    {
+        tft.setTextColor(TFT_GREEN, TFT_BLACK);
+        tft.drawString(data.Name, 2, 2, 1);
+
+        float p;
+        xSemaphoreTake(dataMutex, portMAX_DELAY);
+        p = (float)data.calPress;
+        xSemaphoreGive(dataMutex);
+
+        char        pStr[16];
+        const char *unit;
+        if (p < 1.0f)       { snprintf(pStr, sizeof(pStr), "%.0f", p * 1000.0f); unit = "mTorr"; }
+        else if (p < 100.0f){ snprintf(pStr, sizeof(pStr), "%.1f", p);            unit = "Torr";  }
+        else                 { snprintf(pStr, sizeof(pStr), "%.0f", p);            unit = "Torr";  }
+
+        tft.setTextColor(TFT_WHITE, TFT_BLACK);
+        tftCenter(pStr, 34, 4);
+        tft.setTextColor(TFT_CYAN, TFT_BLACK);
+        tftCenter(unit, 68, 4);
+
+        tft.setTextColor(0x7BEF, TFT_BLACK);
+        String ip = (WiFi.status() == WL_CONNECTED) ? WiFi.localIP().toString() : "---";
+        tftCenter(ip.c_str(), 110, 1);
+        break;
+    }
+    }
+}
+
+#endif  // display implementations
 
 // ---------------------------------------------------------------------------
 // WiFi helpers
@@ -1049,10 +1107,19 @@ void setup()
     Wire.begin(kI2C_SDA, kI2C_SCL, kI2C_Hz);
     pinMode(kBootPin, INPUT_PULLUP);
 
+#ifdef BOARD_WAVESHARE_AMOLED
     if (!canvas->begin())
         Serial.println("Display init failed — check QSPI wiring");
     canvas->fillScreen(C_BLACK);
     canvas->flush();
+#else  // BOARD_LILYGO_TQT
+    pinMode(kTFT_BL, OUTPUT);
+    digitalWrite(kTFT_BL, HIGH);
+    tft.init();
+    tft.setRotation(0);
+    tft.fillScreen(TFT_BLACK);
+    buttonB.begin();
+#endif
 
     cp.registerStream(&Serial);
     cp.registerCommands(&cmdList);
@@ -1101,15 +1168,36 @@ void loop()
         }
     }
 
-    // Boot button long-press: clear WiFi credentials and reboot to portal
+    // Boot button: long-press clears WiFi and reboots; on T-QT short-press trims offset up
     bool bootDown = (digitalRead(kBootPin) == LOW);
     if (bootDown && !bootWasPressed)
     {
         bootWasPressed = true;
         bootPressStart = millis();
     }
-    if (!bootDown)
+#ifdef BOARD_LILYGO_TQT
+    if (!bootDown && bootWasPressed)
+    {
+        if (millis() - bootPressStart < kBootLongPressMs)
+        {
+            // Short press → increase active offset
+            if (data.calPress > kTorrThreshold) data.offsetTorr++;
+            else                                data.offsetmTorr += 10;
+        }
         bootWasPressed = false;
+    }
+    // Button B → decrease active offset
+    buttonB.read();
+    if (buttonB.pressed())
+    {
+        if (data.calPress > kTorrThreshold) data.offsetTorr--;
+        else                                data.offsetmTorr -= 10;
+    }
+    data.offsetTorr  = constrain(data.offsetTorr,  -kMaxOffsetTorr,  kMaxOffsetTorr);
+    data.offsetmTorr = constrain(data.offsetmTorr, -kMaxOffsetmTorr, kMaxOffsetmTorr);
+#else
+    if (!bootDown) bootWasPressed = false;
+#endif
     if (bootWasPressed && (millis() - bootPressStart >= kBootLongPressMs))
     {
         clearCredentials();

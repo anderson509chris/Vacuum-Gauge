@@ -977,9 +977,9 @@ void cmdGetCmds()
 {
     if (!cp.checkExpectedArgs(0)) return;
     cp.sendACK(false);
-    for (int i = 0; cmds[i].name != NULL; i++)
+    for (int i = 0; cmds[i].cmd != NULL; i++)
     {
-        cp.print(cmds[i].name);
+        cp.print(cmds[i].cmd);
         cp.print(",");
         cp.println(cmds[i].help);
     }

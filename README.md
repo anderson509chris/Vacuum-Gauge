@@ -26,10 +26,18 @@ can discover and read any gauge on the local network by name.
   can discover gauges by known names.
 - **HTTP REST API** on port 80 — `GET /pressure` and `GET /status` return JSON
   with CORS headers; no TCP bridge or virtual COM port required.
+- **UDP LAN discovery** on port 6969 — the gauge replies to a `GAACE-DISCOVER`
+  broadcast with its name, type, firmware version, and REST API port, so the
+  desktop app can find gauges without knowing IPs in advance.
 - **User-trimmable zero offsets** — coarse Torr and fine mTorr — set over the
-  USB serial command interface.
+  USB serial command interface (and, on the Waveshare board, the on-screen
+  calibration menu).
 - **Two pressure-conversion modes:** factory formula, or a field-editable
   piece-wise-linear (PWL) calibration table.
+- **Touchscreen calibration menu** (Waveshare AMOLED only) — tap the **CAL**
+  button bottom-right of the gauge screen to set the cal mode, trim the zero
+  offset, capture PWL cal points, or clear/restore the table, all without a
+  serial connection.
 - Settings (offsets, calibration table, WiFi credentials, gauge name) persisted
   to NVS (flash) via the ESP32 Preferences library; auto-saved when changed.
 - Long-press the **BOOT button** (3 s) to clear WiFi credentials and reboot
@@ -43,6 +51,7 @@ can discover and read any gauge on the local network by name.
 | ----------- | -------------------------------------------------------------- |
 | MCU         | ESP32-S3R8, 16 MB Flash (QIO), 8 MB OPI PSRAM                 |
 | Display     | 280 × 456 CO5300 AMOLED, QSPI (software-rotated to landscape) |
+| Touch       | FT3168, I2C `0x38` — SDA = GPIO 47, SCL = GPIO 48 (own bus)   |
 | Sensor      | Posifa, I2C `0x50` — SDA = GPIO 1, SCL = GPIO 2               |
 | BOOT button | GPIO 0 — long-press (3 s) resets WiFi credentials             |
 
@@ -110,9 +119,26 @@ Torr otherwise.
 ### Desktop app discovery
 
 The app scans for devices named **Gauge A** through **Gauge H** on the local
-network (mDNS or direct IP poll via `/status`). Because the gauge identity is
-chosen from a fixed list at setup time, the app always knows the full set of
-possible names.
+network. Because the gauge identity is chosen from a fixed list at setup time,
+the app always knows the full set of possible names — it can either resolve
+them via UDP discovery (below) or poll `/status` directly once it knows an IP.
+
+## UDP LAN discovery
+
+Once connected to WiFi, the gauge listens for UDP broadcasts on **port 6969**.
+Send the ASCII payload `GAACE-DISCOVER`; the gauge replies directly to the
+sender's IP/port with a newline-delimited block:
+
+```
+GAACE-DEVICE
+NAME,Gauge A
+TYPE,vacuum_gauge
+VERSION,1.0
+PORT,80
+```
+
+`PORT` is the gauge's HTTP REST API port (see above) — there is no separate
+TCP service.
 
 ## USB serial command interface
 
@@ -164,6 +190,12 @@ commands are get/set pairs.
    - The table is sorted by raw value and saved to NVS immediately.
 4. Repeat at other pressures. Use `CALDUMP` to review, `CALCLEAR` to start
    over, `CALDEF` to restore the factory table.
+
+On the Waveshare board, the same workflow is available without a serial
+connection: tap **CAL** on the gauge screen, **SET POINT**, dial in the
+reference pressure with the `±100`/`±10`/`±1`/`±.1`/`±.01` buttons, then
+**CAPTURE**. **CLEAR** and **DEFAULTS** are also available from that menu,
+each behind a confirm step.
 
 The table holds up to **32 points**. More points near the steep part of the
 sensor curve (near atmosphere) improve accuracy. Readings outside the

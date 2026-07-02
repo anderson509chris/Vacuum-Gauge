@@ -14,6 +14,7 @@
 #include <Arduino.h>
 #include <Wire.h>
 #include <WiFi.h>
+#include <WiFiUdp.h>
 #include <DNSServer.h>
 #include <Preferences.h>
 #include <ESPAsyncWebServer.h>
@@ -52,6 +53,10 @@
   static const int16_t kScreenH    = 280;
   static const int     kI2C_SDA    = 1;
   static const int     kI2C_SCL    = 2;
+  // FT3168 capacitive touch — separate I2C bus from the Posifa sensor
+  static const int     kTouchSDA   = 47;
+  static const int     kTouchSCL   = 48;
+  static const uint8_t kTouchAddr  = 0x38;
 #else  // BOARD_LILYGO_TQT
   static const int16_t kScreenW    = 128;
   static const int16_t kScreenH    = 128;
@@ -148,7 +153,13 @@ Data lastSaved;
 // App state
 // ---------------------------------------------------------------------------
 
-enum AppState { STATE_PORTAL, STATE_CONNECTING, STATE_RUNNING };
+enum AppState
+{
+    STATE_PORTAL, STATE_CONNECTING, STATE_RUNNING
+#ifdef BOARD_WAVESHARE_AMOLED
+    , STATE_CAL_MENU, STATE_CAL_SETPOINT, STATE_CAL_CONFIRM
+#endif
+};
 static AppState appState = STATE_PORTAL;
 
 // ---------------------------------------------------------------------------
@@ -164,6 +175,7 @@ static AppState appState = STATE_PORTAL;
   static Arduino_GFX    *display = new Arduino_CO5300(
       bus, kQSPI_RST, 0, 280, 456, 20, 0, 180, 24);
   static Arduino_Canvas *canvas  = new Arduino_Canvas(280, 456, display, 0, 0, 1);
+  static TwoWire         touchWire = TwoWire(1);
 #else  // BOARD_LILYGO_TQT
   static TFT_eSPI tft = TFT_eSPI();
   static Button   buttonB(kButtonB_Pin);
@@ -171,6 +183,11 @@ static AppState appState = STATE_PORTAL;
 
 static AsyncWebServer server(80);
 static DNSServer      dnsServer;
+static WiFiUDP        discoveryUdp;
+
+static const uint16_t kDiscoveryPort = 6969;
+static const char    *kDiscoverMsg   = "GAACE-DISCOVER";
+static const uint16_t kServicePort   = 80;   // HTTP REST API port — see setupServer()
 
 commandProcessor cp;
 debug            dbg(&cp);
@@ -450,6 +467,214 @@ static void centerText(const char *str, int16_t y, uint8_t sz)
     canvas->print(str);
 }
 
+// ---------------------------------------------------------------------------
+// Touch (FT3168) — gauge calibration menu
+// ---------------------------------------------------------------------------
+
+static const uint8_t kFT3168_REG_TOUCHCOUNT = 0x02;  // + 0x03..0x06 = X1H,X1L,Y1H,Y1L
+
+// Native panel is portrait 280x456; canvas rotation=1 (90° CW) remaps draw
+// calls into the landscape 456x280 logical space used everywhere else in
+// this file. The touch IC reports points in that same native portrait
+// frame, so invert the rotation here: logical_x = raw_y, logical_y = 279 - raw_x.
+static bool readTouchPoint(int &lx, int &ly)
+{
+    uint8_t buf[5];
+    touchWire.beginTransmission(kTouchAddr);
+    touchWire.write(kFT3168_REG_TOUCHCOUNT);
+    if (touchWire.endTransmission(false) != 0) return false;
+    if (touchWire.requestFrom((int)kTouchAddr, 5) != 5) return false;
+    for (int i = 0; i < 5; i++) buf[i] = touchWire.read();
+
+    uint8_t fingers = buf[0];
+    if (fingers == 0 || fingers > 2) return false;
+
+    int rawX = ((buf[1] & 0x0F) << 8) | buf[2];
+    int rawY = ((buf[3] & 0x0F) << 8) | buf[4];
+
+    lx = rawY;
+    ly = 279 - rawX;
+    return true;
+}
+
+struct UIButton { int16_t x0, y0, x1, y1; };
+
+static bool hitButton(const UIButton &b, int tx, int ty)
+{
+    return tx >= b.x0 && tx <= b.x1 && ty >= b.y0 && ty <= b.y1;
+}
+
+static void drawButton(const UIButton &b, const char *label, uint16_t color, uint8_t textSz)
+{
+    canvas->drawRect(b.x0, b.y0, b.x1 - b.x0, b.y1 - b.y0, color);
+    canvas->setTextColor(color);
+    canvas->setTextSize(textSz);
+    int16_t  x1, y1;
+    uint16_t w, h;
+    canvas->getTextBounds(label, 0, 0, &x1, &y1, &w, &h);
+    canvas->setCursor(b.x0 + ((b.x1 - b.x0) - (int16_t)w) / 2 - x1,
+                       b.y0 + ((b.y1 - b.y0) - (int16_t)h) / 2 - y1);
+    canvas->print(label);
+}
+
+// Main running screen
+static const UIButton kBtnCalOpen = { kScreenW - 48, kScreenH - 40, kScreenW - 4, kScreenH - 4 };
+
+// CAL_MENU screen
+static const UIButton kBtnExit    = { 416,  4, 452,  36 };
+static const UIButton kBtnMode    = {   8, 50, 150, 100 };
+static const UIButton kBtnOffDn   = { 160, 50, 302, 100 };
+static const UIButton kBtnOffUp   = { 312, 50, 454, 100 };
+static const UIButton kBtnSetPt   = {   8,110, 150, 160 };
+static const UIButton kBtnClear   = { 160,110, 302, 160 };
+static const UIButton kBtnDefault = { 312,110, 454, 160 };
+
+// CAL_SETPOINT screen
+static const int   kStepCols           = 5;
+static const float kStepVals[kStepCols] = { 100.0f, 10.0f, 1.0f, 0.1f, 0.01f };
+static const char *kStepPlusLabels[kStepCols]  = { "+100", "+10", "+1", "+.1", "+.01" };
+static const char *kStepMinusLabels[kStepCols] = { "-100", "-10", "-1", "-.1", "-.01" };
+static const UIButton kBtnPlus[kStepCols] =
+{
+    {  4, 95,  88,135}, { 94, 95, 178,135}, {184, 95, 268,135},
+    {274, 95, 358,135}, {364, 95, 448,135},
+};
+static const UIButton kBtnMinus[kStepCols] =
+{
+    {  4,140,  88,180}, { 94,140, 178,180}, {184,140, 268,180},
+    {274,140, 358,180}, {364,140, 448,180},
+};
+static const UIButton kBtnCapture = {  8,200, 224,260 };
+static const UIButton kBtnSetBack = {232,200, 448,260 };
+
+// CAL_CONFIRM screen
+static const UIButton kBtnYes = { 60,150, 200,210 };
+static const UIButton kBtnNo  = {256,150, 396,210 };
+
+enum CalConfirmAction { CAL_CONFIRM_CLEAR, CAL_CONFIRM_DEFAULTS };
+static CalConfirmAction calConfirmAction = CAL_CONFIRM_CLEAR;
+static float            calSetpointTorr  = 0.0f;
+static bool             touchWasDown     = false;
+static unsigned long    lastTouchMs      = 0;
+static bool             needsRedraw      = false;
+
+static void handleTouch()
+{
+    int  tx, ty;
+    bool down = readTouchPoint(tx, ty);
+
+    if (down && !touchWasDown && (millis() - lastTouchMs) > 150)
+    {
+        lastTouchMs = millis();
+        switch (appState)
+        {
+        case STATE_RUNNING:
+            if (hitButton(kBtnCalOpen, tx, ty))
+            {
+                appState = STATE_CAL_MENU;
+                needsRedraw = true;
+            }
+            break;
+
+        case STATE_CAL_MENU:
+            if (hitButton(kBtnExit, tx, ty))
+            {
+                appState = STATE_RUNNING;
+                needsRedraw = true;
+            }
+            else if (hitButton(kBtnMode, tx, ty))
+            {
+                data.useCalTable = data.useCalTable ? 0 : 1;
+                needsRedraw = true;
+            }
+            else if (hitButton(kBtnOffDn, tx, ty) || hitButton(kBtnOffUp, tx, ty))
+            {
+                int dir = hitButton(kBtnOffUp, tx, ty) ? 1 : -1;
+                if (data.calPress > kTorrThreshold) data.offsetTorr  += dir;
+                else                                data.offsetmTorr += dir * 10;
+                data.offsetTorr  = constrain(data.offsetTorr,  -kMaxOffsetTorr,  kMaxOffsetTorr);
+                data.offsetmTorr = constrain(data.offsetmTorr, -kMaxOffsetmTorr, kMaxOffsetmTorr);
+                needsRedraw = true;
+            }
+            else if (hitButton(kBtnSetPt, tx, ty))
+            {
+                calSetpointTorr = (float)data.calPress;
+                appState = STATE_CAL_SETPOINT;
+                needsRedraw = true;
+            }
+            else if (hitButton(kBtnClear, tx, ty))
+            {
+                calConfirmAction = CAL_CONFIRM_CLEAR;
+                appState = STATE_CAL_CONFIRM;
+                needsRedraw = true;
+            }
+            else if (hitButton(kBtnDefault, tx, ty))
+            {
+                calConfirmAction = CAL_CONFIRM_DEFAULTS;
+                appState = STATE_CAL_CONFIRM;
+                needsRedraw = true;
+            }
+            break;
+
+        case STATE_CAL_SETPOINT:
+            if (hitButton(kBtnSetBack, tx, ty))
+            {
+                appState = STATE_CAL_MENU;
+                needsRedraw = true;
+            }
+            else if (hitButton(kBtnCapture, tx, ty))
+            {
+                int raw = sampleRawAveraged(kCalAvgSamples);
+                addCalPoint(raw, calSetpointTorr);
+                saveData();
+                lastSaved = data;
+                appState = STATE_CAL_MENU;
+                needsRedraw = true;
+            }
+            else
+            {
+                for (int i = 0; i < kStepCols; i++)
+                {
+                    if (hitButton(kBtnPlus[i], tx, ty))
+                    {
+                        calSetpointTorr = constrain(calSetpointTorr + kStepVals[i], 0.0f, 800.0f);
+                        needsRedraw = true;
+                        break;
+                    }
+                    if (hitButton(kBtnMinus[i], tx, ty))
+                    {
+                        calSetpointTorr = constrain(calSetpointTorr - kStepVals[i], 0.0f, 800.0f);
+                        needsRedraw = true;
+                        break;
+                    }
+                }
+            }
+            break;
+
+        case STATE_CAL_CONFIRM:
+            if (hitButton(kBtnYes, tx, ty))
+            {
+                if (calConfirmAction == CAL_CONFIRM_CLEAR) data.calCount = 0;
+                else                                       loadDefaultCalTable();
+                saveData();
+                lastSaved = data;
+                appState = STATE_CAL_MENU;
+                needsRedraw = true;
+            }
+            else if (hitButton(kBtnNo, tx, ty))
+            {
+                appState = STATE_CAL_MENU;
+                needsRedraw = true;
+            }
+            break;
+
+        default:
+            break;
+        }
+    }
+    touchWasDown = down;
+}
+
 static void updateDisplay()
 {
     canvas->fillScreen(C_BLACK);
@@ -507,8 +732,69 @@ static void updateDisplay()
         canvas->print("IP: "); canvas->print(ip);
         canvas->setCursor(4, kScreenH - 20);
         canvas->print("Cal: "); canvas->print(data.useCalTable ? "Table" : "Factory");
+
+        drawButton(kBtnCalOpen, "CAL", C_LGRAY, 1);
         break;
     }
+
+    case STATE_CAL_MENU:
+    {
+        canvas->setTextColor(C_YELLOW);
+        centerText("CALIBRATION", 4, 2);
+        drawButton(kBtnExit, "X", C_WHITE, 2);
+
+        drawButton(kBtnMode,    data.useCalTable ? "MODE: TABLE" : "MODE: FACTORY", C_CYAN,  1);
+        drawButton(kBtnOffDn,   "OFFSET -",  C_WHITE, 1);
+        drawButton(kBtnOffUp,   "OFFSET +",  C_WHITE, 1);
+        drawButton(kBtnSetPt,   "SET POINT", C_GREEN, 1);
+        drawButton(kBtnClear,   "CLEAR",     C_WHITE, 1);
+        drawButton(kBtnDefault, "DEFAULTS",  C_WHITE, 1);
+
+        char offStr[24];
+        if (data.calPress > kTorrThreshold)
+            snprintf(offStr, sizeof(offStr), "Offset: %+d Torr", data.offsetTorr);
+        else
+            snprintf(offStr, sizeof(offStr), "Offset: %+d mTorr", data.offsetmTorr);
+        canvas->setTextColor(C_LGRAY);
+        centerText(offStr, 175, 2);
+
+        char ptsStr[24];
+        snprintf(ptsStr, sizeof(ptsStr), "Cal points: %d", data.calCount);
+        centerText(ptsStr, 200, 2);
+        break;
+    }
+
+    case STATE_CAL_SETPOINT:
+    {
+        canvas->setTextColor(C_YELLOW);
+        centerText("SET CAL POINT", 4, 2);
+
+        char rawStr[24];
+        snprintf(rawStr, sizeof(rawStr), "Raw: %d", data.rawData);
+        canvas->setTextColor(C_LGRAY);
+        centerText(rawStr, 28, 2);
+
+        char valStr[24];
+        snprintf(valStr, sizeof(valStr), "%.2f Torr", calSetpointTorr);
+        canvas->setTextColor(C_WHITE);
+        centerText(valStr, 55, 3);
+
+        for (int i = 0; i < kStepCols; i++)
+        {
+            drawButton(kBtnPlus[i],  kStepPlusLabels[i],  C_GREEN, 1);
+            drawButton(kBtnMinus[i], kStepMinusLabels[i], C_CYAN,  1);
+        }
+        drawButton(kBtnCapture, "CAPTURE", C_GREEN, 2);
+        drawButton(kBtnSetBack, "BACK",    C_WHITE, 2);
+        break;
+    }
+
+    case STATE_CAL_CONFIRM:
+        canvas->setTextColor(C_YELLOW);
+        centerText(calConfirmAction == CAL_CONFIRM_CLEAR ? "Clear cal table?" : "Restore factory defaults?", 80, 2);
+        drawButton(kBtnYes, "YES", C_GREEN, 2);
+        drawButton(kBtnNo,  "NO",  C_WHITE, 2);
+        break;
     }
     canvas->flush();
 }
@@ -600,6 +886,37 @@ static void startSTA()
     WiFi.begin(data.ssid, data.pass);
     connectStartMs = millis();
     appState = STATE_CONNECTING;
+}
+
+// LAN discovery: GAA-CE desktop app broadcasts GAACE-DISCOVER on this UDP
+// port; reply directly to the sender with our identity and REST API port.
+static void handleDiscovery()
+{
+    int packetSize = discoveryUdp.parsePacket();
+    if (packetSize <= 0) return;
+
+    char buf[32];
+    int len = discoveryUdp.read(buf, sizeof(buf) - 1);
+    if (len <= 0) return;
+    buf[len] = '\0';
+
+    if (strcmp(buf, kDiscoverMsg) != 0) return;
+
+    IPAddress remoteIp   = discoveryUdp.remoteIP();
+    uint16_t  remotePort = discoveryUdp.remotePort();
+
+    char reply[160];
+    snprintf(reply, sizeof(reply),
+             "GAACE-DEVICE\n"
+             "NAME,%s\n"
+             "TYPE,vacuum_gauge\n"
+             "VERSION,%s\n"
+             "PORT,%u\n",
+             data.Name, FIRMWARE_VERSION, kServicePort);
+
+    discoveryUdp.beginPacket(remoteIp, remotePort);
+    discoveryUdp.write((const uint8_t *)reply, strlen(reply));
+    discoveryUdp.endPacket();
 }
 
 // ---------------------------------------------------------------------------
@@ -1112,6 +1429,11 @@ void setup()
         Serial.println("Display init failed — check QSPI wiring");
     canvas->fillScreen(C_BLACK);
     canvas->flush();
+    touchWire.begin(kTouchSDA, kTouchSCL, kI2C_Hz);
+    touchWire.beginTransmission(kTouchAddr);
+    touchWire.write((uint8_t)0x00);  // device mode register
+    touchWire.write((uint8_t)0x00);  // 0x00 = normal operating mode
+    touchWire.endTransmission();
 #else  // BOARD_LILYGO_TQT
     pinMode(kTFT_BL, OUTPUT);
     digitalWrite(kTFT_BL, HIGH);
@@ -1160,6 +1482,7 @@ void loop()
             appState = STATE_RUNNING;
             Serial.print("Connected, IP: ");
             Serial.println(WiFi.localIP());
+            discoveryUdp.begin(kDiscoveryPort);
         }
         else if (millis() - connectStartMs > 30000)
         {
@@ -1167,6 +1490,9 @@ void loop()
             startAP();
         }
     }
+
+    if (appState == STATE_RUNNING)
+        handleDiscovery();
 
     // Boot button: long-press clears WiFi and reboots; on T-QT short-press trims offset up
     bool bootDown = (digitalRead(kBootPin) == LOW);
@@ -1207,9 +1533,17 @@ void loop()
 
     // Display refresh
     unsigned long now = millis();
-    if (now - lastDisplayMs >= 500)
+    bool forceRedraw = false;
+#ifdef BOARD_WAVESHARE_AMOLED
+    handleTouch();
+    forceRedraw = needsRedraw;
+#endif
+    if (now - lastDisplayMs >= 500 || forceRedraw)
     {
         lastDisplayMs = now;
+#ifdef BOARD_WAVESHARE_AMOLED
+        needsRedraw = false;
+#endif
         updateDisplay();
     }
 
